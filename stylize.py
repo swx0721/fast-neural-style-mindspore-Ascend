@@ -1,135 +1,134 @@
-import torch
-import utils
+# stylize.py - 最终修正版 (复现训练采样图的纯净效果 + 移除不必要后处理)
+import mindspore as ms
+from mindspore import Tensor, context, ops
+# 导入正确的模块名称
 import transformer
+import utils
 import os
-from torchvision import transforms
 import time
+from transformer import TransformerNet # 从 transformer.py 导入
 import cv2
+import numpy as np
 
-STYLE_TRANSFORM_PATH = "transforms/udnie_aggressive.pth"
-PRESERVE_COLOR = False
+# ------------------ GLOBAL SETTINGS ------------------
+# 请将此路径替换为您实际训练得到的 checkpoint 路径
+STYLE_TRANSFORM_PATH = "models1/sumiao_checkpoint_4000.ckpt" 
+PRESERVE_COLOR = True # <<< 关键修正 1：强制关闭色彩迁移
+target_device = "Ascend"
+OUTPUT_DIR = "images/results1/"#原images/results
+context.set_context(mode=context.GRAPH_MODE, device_target=target_device)
 
+# ------------------ 单图风格迁移 ------------------
 def stylize():
-    # Device
-    device = ("cuda" if torch.cuda.is_available() else "cpu")
+    global STYLE_TRANSFORM_PATH
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
 
-    # Load Transformer Network
-    net = transformer.TransformerNetwork()
-    net.load_state_dict(torch.load(STYLE_TRANSFORM_PATH))
-    net = net.to(device)
+    # 1. 加载网络（保持不变）
+    while True:
+        try:
+            # 默认 TransformerNet() 是 standard mode，如果训练时使用了 high_res_mode 需要传入对应参数
+            net = TransformerNet() 
+            # 检查模型文件是否存在
+            if not os.path.exists(STYLE_TRANSFORM_PATH):
+                 print(f"❌ 模型文件未找到: {STYLE_TRANSFORM_PATH}")
+                 STYLE_TRANSFORM_PATH = input("请输入正确的 checkpoint 路径：").strip()
+                 continue
+                 
+            param_dict = ms.load_checkpoint(STYLE_TRANSFORM_PATH)
+            ms.load_param_into_net(net, param_dict)
+            net.set_train(False)
+            print("✅ Transformer Network Loaded Successfully.\n")
+            break
+        except Exception as e:
+            print(f"❌ 加载模型失败: {e}")
+            STYLE_TRANSFORM_PATH = input("请输入正确的 checkpoint 路径：").strip()
+            continue
 
-    with torch.no_grad():
-        while(1):
-            torch.cuda.empty_cache()
-            print("Stylize Image~ Press Ctrl+C and Enter to close the program")
-            content_image_path = input("Enter the image path: ")
+    # 2. 推理循环
+    while True:
+        try:
+            print("\n🎨 Stylize Image~ 输入 Ctrl+C 退出程序")
+            content_image_path = input("请输入内容图像路径： ").strip()
+            if content_image_path == "" or not os.path.isfile(content_image_path):
+                print("⚠ 无效路径，请重新输入。")
+                continue
+
             content_image = utils.load_image(content_image_path)
+            if content_image is None:
+                print("❌ 图像加载失败，请检查格式（支持jpg/png）。")
+                continue
+
             starttime = time.time()
-            content_tensor = utils.itot(content_image).to(device)
-            generated_tensor = net(content_tensor)
-            generated_image = utils.ttoi(generated_tensor.detach())
-            if (PRESERVE_COLOR):
-                generated_image = utils.transfer_color(content_image, generated_image)
-            print("Transfer Time: {}".format(time.time() - starttime))
-            utils.show(generated_image)
-            utils.saveimg(generated_image, "helloworld.jpg")
-
-def stylize_folder_single(style_path, content_folder, save_folder):
-    """
-    Reads frames/pictures as follows:
-
-    content_folder
-        pic1.ext
-        pic2.ext
-        pic3.ext
-        ...
-
-    and saves as the styled images in save_folder as follow:
-
-    save_folder
-        pic1.ext
-        pic2.ext
-        pic3.ext
-        ...
-    """
-    # Device
-    device = ("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Load Transformer Network
-    net = transformer.TransformerNetwork()
-    net.load_state_dict(torch.load(style_path))
-    net = net.to(device)
-
-    # Stylize every frame
-    images = [img for img in os.listdir(content_folder) if img.endswith(".jpg")]
-    with torch.no_grad():
-        for image_name in images:
-            # Free-up unneeded cuda memory
-            torch.cuda.empty_cache()
+            h, w = content_image.shape[:2]
             
-            # Load content image
-            content_image = utils.load_image(content_folder + image_name)
-            content_tensor = utils.itot(content_image).to(device)
+            print(f"📸 检测到图像分辨率 ({w}x{h})，启用无伪影自适应推理...")
+            # 核心推理：使用 utils 中的 infer_adaptive，返回 BGR numpy [0, 255]
+            generated_image = utils.infer_adaptive(net, content_image)
 
-            # Generate image
-            generated_tensor = net(content_tensor)
-            generated_image = utils.ttoi(generated_tensor.detach())
-            if (PRESERVE_COLOR):
+            # -------------------- 后处理 --------------------
+            if PRESERVE_COLOR:
                 generated_image = utils.transfer_color(content_image, generated_image)
-            # Save image
-            utils.saveimg(generated_image, save_folder + image_name)
+            # ❗ 关键修正 2：移除所有不必要的色彩校准代码
+            # ----------------------------------------------------
 
-def stylize_folder(style_path, folder_containing_the_content_folder, save_folder, batch_size=1):
-    """Stylizes images in a folder by batch
-    If the images  are of different dimensions, use transform.resize() or use a batch size of 1
-    IMPORTANT: Put content_folder inside another folder folder_containing_the_content_folder
+            output_filename = "styled_" + os.path.basename(content_image_path)
+            output_path = os.path.join(OUTPUT_DIR, output_filename)
+            utils.saveimg(generated_image, output_path)
 
-    folder_containing_the_content_folder
-        content_folder
-            pic1.ext
-            pic2.ext
-            pic3.ext
-            ...
+            print(f"✅ 风格迁移完成，结果保存至: {output_path}")
+            print(f"⏱ 推理耗时: {time.time() - starttime:.2f} 秒\n")
+            
+        except KeyboardInterrupt:
+            print("\n程序退出。")
+            break
+        except Exception as e:
+            print(f"发生错误: {e}")
 
-    and saves as the styled images in save_folder as follow:
+# ------------------ 文件夹批量风格迁移 ------------------
+def stylize_folder(content_folder, save_folder=None, batch_size=1):
+    if save_folder is None:
+        save_folder = os.path.join(content_folder, "styled_results_ascend")
+    if not os.path.exists(save_folder):
+        os.makedirs(save_folder)
 
-    save_folder
-        pic1.ext
-        pic2.ext
-        pic3.ext
-        ...
-    """
-    # Device
-    device = ("cuda" if torch.cuda.is_available() else "cpu")
+    net = TransformerNet()
+    param_dict = ms.load_checkpoint(STYLE_TRANSFORM_PATH)
+    ms.load_param_into_net(net, param_dict)
+    net.set_train(False)
 
-    # Image loader
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Lambda(lambda x: x.mul(255))
-    ])
-    image_dataset = utils.ImageFolderWithPaths(folder_containing_the_content_folder, transform=transform)
-    image_loader = torch.utils.data.DataLoader(image_dataset, batch_size=batch_size)
+    image_ext = ('.jpg', '.jpeg', '.png', '.bmp')
+    image_paths = [
+        os.path.join(content_folder, f)
+        for f in os.listdir(content_folder)
+        if f.lower().endswith(image_ext)
+    ]
 
-    # Load Transformer Network
-    net = transformer.TransformerNetwork()
-    net.load_state_dict(torch.load(style_path))
-    net = net.to(device)
+    if not image_paths:
+        print("⚠ 文件夹内未检测到图像文件")
+        return
 
-    # Stylize batches of images
-    with torch.no_grad():
-        for content_batch, _, path in image_loader:
-            # Free-up unneeded cuda memory
-            torch.cuda.empty_cache()
+    for i in range(0, len(image_paths), batch_size):
+        batch_paths = image_paths[i:i + batch_size]
+        for img_path in batch_paths:
+            content_image = utils.load_image(img_path)
+            if content_image is None:
+                print(f"❌ 跳过无效图像: {img_path}")
+                continue
+            
+            h, w = content_image.shape[:2]
+            print(f"📸 批量处理: {os.path.basename(img_path)} ({w}x{h})")
+            generated_image = utils.infer_adaptive(net, content_image)
+            
+            if PRESERVE_COLOR: 
+                generated_image = utils.transfer_color(content_image, generated_image)
+            
+            # ❗ 关键修正 3：移除批量处理中的不必要的色彩校准代码
+            
+            output_filename = "styled_" + os.path.basename(img_path)
+            output_path = os.path.join(save_folder, output_filename)
+            utils.saveimg(generated_image, output_path)
+            print(f"✅ 保存至: {output_path}")
 
-            # Generate image
-            generated_tensor = net(content_batch.to(device)).detach()
-
-            # Save images
-            for i in range(len(path)):
-                generated_image = utils.ttoi(generated_tensor[i])
-                if (PRESERVE_COLOR):
-                    generated_image = utils.transfer_color(content_image, generated_image)
-                image_name = os.path.basename(path[i])
-                utils.saveimg(generated_image, save_folder + image_name)
-
-#stylize()
+if __name__ == '__main__':
+    stylize()
